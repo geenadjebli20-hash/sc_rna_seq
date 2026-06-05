@@ -1,0 +1,739 @@
+---
+title: "Single_cell_stade_16_filtrage_fixées"
+author: "Djebli Geena"
+format: html
+editor: visual
+---
+
+## Filtrage, Doubletfinder et clustering
+
+Ce pipeline vise à filtrer les données de séquençage d’ARN en *single-cell RNA-seq* obtenues chez l’oursin au stade **16 cellules fixées du deuxième échantillon**. Les données utilisées sont issues de l’alignement des reads brutes via le pipeline automatisé "**Cell Ranger"** (se référer à la partie Cell Ranger).
+
+Deux jeux de données sont traités ici : le fichier déjà filtré par Cell Ranger et le fichier brut (« raw »). Ce dernier sera filtré manuellement dans ce document afin de comparer nos résultats à ceux fournis par l'outil automatisé. Effectuer son propre filtrage permet de choisir la finnesse des ses filtres, et mieux comprendre ce qui se passe.
+
+## Étape préliminaire
+
+**Configuration de l'environnement :**
+
+Dans un premier temps, il est nécessaire d'installer les packages qui seront utilisés pour l'analyse. Cette installation n'est à effectuer qu'une seule fois sur la machine. Par la suite, il suffira de charger les bibliothèques (libraries) au début de chaque session pour accéder aux outils et fonctions requis.
+
+-   **Instalation packages** (à faire qu'une fois) :
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+# Installation des packages si nécessaire
+# install.packages(c("Seurat", "SeuratObject", "remotes", "clustree")) 
+# Pour les lancer il faut enlever le "#" devant. 
+```
+
+**Seurat & SeuratObject** : il s'agit de bibliothèques de références pour l'analyse de données en Single Cell. Seurat fournit les algorithmes de normalisation, de réduction de dimension (PCA, UMAP) et de clustering. SeuratObject définit la structure de données qui stocke de manière optimisée les matrices d'expression et les métadonnées des cellules.
+
+**remotes** : ce package permet d'installer des outils qui ne sont pas encore sur les dépôts officiels (CRAN), mais disponibles directement sur des plateformes comme GitHub.
+
+**clustree** : cet outil de visualisation est utilisé pour évaluer la stabilité des clusters. Il permet de construire un "arbre de clustering" afin de visualiser comment les cellules se répartissent entre les différents groupes lorsque l'on fait varier la résolution de l'analyse.
+
+-   **Chargement des bibliothèques** :
+
+```{r}
+#| label: load-libraries
+#| message: false
+#| warning: false
+
+library(Seurat)
+library(DoubletFinder)
+library(dplyr)
+library(ggplot2)
+library(future)
+library(clustree)
+
+```
+
+**Analyse Single-Cell et Contrôle Qualité :**
+
+**Seurat** : L'outil principale utilisé pour l'analyse des données de Single Cell.
+
+**DoubletFinder** : Un package qui permet de détecter et exclure les "doublets" (deux cellules capturées dans une seule gouttelette), ce qui évite les artefacts d'expression dans l'analyse.
+
+**Manipulation et Calcul :**
+
+**dplyr** : permet de filtrer les métadonnées ou réorganiser les tableaux de comptage.
+
+**future** : utilisé pour activer le calcul en parallèle. Cela permet d'accélérer considérablement les étapes gourmandes en ressources (comme l'analyse de voisinage ou le clustering) en utilisant plusieurs cœurs de votre processeur, purement informatique, pour bien exploiter l'appareil utilisé.
+
+**Visualisation et Validation :**
+
+**ggplot2** : permet de créer des figures sur mesure et de haute qualité.
+
+**clustree** : il sert à visualiser la stabilité du partitionnement des cellules selon différentes résolutions. Voir le comportement des clusters.
+
+-   **Configuration mémoire** :
+
+```{r}
+#| label: memory-config
+#| echo: true
+#| message: false
+#| warning: false
+
+# Augmente la limite de taille de la mémoire pour le calcul parallèle (16 Go)
+options(future.globals.maxSize = 15000 * 1024^2)
+
+# Utiliser les coeurs disponibles
+# Cela permet d'accélérer Seurat 
+plan("multisession", workers = parallel::detectCores() - 1)
+
+```
+
+## Comparaison des données brutes (raw) et filtrées (filtered)
+
+Une fois l'environnement de travail configuré pour le traitement et l'analyse, nous procédons à l'importation des jeux de données. L'objectif est de comparer les données brutes aux données filtrées par Cell Ranger afin d'évaluer la qualité initiale de l'échantillon et la pertinence du filtrage automatisé.
+
+-   **Importation des données** (brutes et filtrées)
+
+```{r}
+#| label: load-datas 
+#| message: false
+#| warning: false
+
+# Charger les données brutes (Raw)
+raw_data_16f_bis<- Read10X(data.dir = "/Users/gege/Desktop/50-1319402224/10_cellranger_multi/urchin_lib2f_out/outs/per_sample_outs/sample4_OB4_F/sample_raw_feature_bc_matrix")# ici il faut mettre le chemin des fichiers sur l'ordi où est lancé le pipline
+seurat_raw_16f_bis <- CreateSeuratObject(counts = raw_data_16f_bis, project = "Raw_Data_16f_bis")
+
+# Charger les données filtrées par Cell Ranger (Filtered)
+filtered_data_16f_bis <- Read10X(data.dir = "/Users/gege/Desktop/50-1319402224/10_cellranger_multi/urchin_lib2f_out/outs/per_sample_outs/sample4_OB4_F/sample_filtered_feature_bc_matrix")
+seurat_filtered_16f_bis <- CreateSeuratObject(counts = filtered_data_16f_bis, project = "Filtered_Data_16f_bis")
+
+```
+
+**Raw Feature BC Matrix** : Contient l'intégralité des codes-barres (barcodes) détectés, y compris ceux correspondant à des gouttelettes vides ou contenant uniquement de l'ARN dans le milieu. C'est notre point de départ pour un filtrage personnalisé.
+
+**Filtered Feature BC Matrix** : Ce jeu de données a déjà subi le filtrage automatisé de Cell Ranger, qui utilise un algorithme pour ne conserver que les gouttelettes considérées comme de "vraies" cellules.(Se doccumenter dessus pour bien comprendre)
+
+-   **Comparaison**
+
+```{r}
+#| label: compare-data
+#| message: false
+#| warning: false
+
+# Comparaison du nombre de cellules :
+stats_16f_bis <- data.frame(
+  "Type de données" = c("Brutes (Raw)", "Filtrées (Cell Ranger)"),
+  "Nombre de Barcodes" = c(ncol(seurat_raw_16f_bis), ncol(seurat_filtered_16f_bis)),
+  "Médiane Gènes/Cellule" = c(median(seurat_raw_16f_bis$nFeature_RNA), median(seurat_filtered_16f_bis$nFeature_RNA)),
+  check.names = FALSE 
+)
+print(stats_16f_bis)
+
+```
+
+L'écart entre les données brutes et les données filtrées par Cell Ranger met en évidence l'importance de l'étape de nettoyage.
+
+**Données Brutes (Raw)** : On observe un nombre impressionant de codes-barres (920067). Cependant, la médiane du nombre de gènes par cellule est de 2. Cela indique que l'immense majorité de ces codes-barres correspond à des gouttelettes vides, à des débris cellulaires ou à du bruit de fond ne contenant aucune information biologique exploitable. On choisi la médiane ici, car elle est plus représentative que la moyenne.
+
+**Données Filtrées (Cell Ranger)** : Après le filtrage de Cell Ranger, le jeu de données est réduit à 4196 cellules potentielles. Pour ces dernières, la médiane s'élève à 5216.5 gènes par cellule, ce qui témoigne d'une bonne profondeur de séquençage et de la capture de bonnes cellules.
+
+Le pipeline Cell Ranger a éliminé une grande majorité des codes-barres initiaux. Ce filtrage fort est normal : il permet de passer de données immenses et bruitées à un jeu de données exploitable composé uniquement de véritables cellules.
+
+En premier, il faut éliminer le bruit de fond (donné par les billes vides)
+
+## La sélection des barcodes
+
+Après avoir comparé les données brutes aux résultats de Cell Ranger, nous débutons le processus de filtrage manuel. La première étape commence dans la sélection des codes-barres (barcodes). Cette analyse permet de définir un seuil de coupure afin de distinguer les véritables cellules des gouttelettes vides ou des débris, permettant ainsi un premier filtrage.
+
+```{r}
+#| label: selection-barcodes
+#| message: false
+#| warning: false
+
+# Préparation des données
+counts_bc_16f_bis <- sort(seurat_raw_16f_bis$nCount_RNA, decreasing = TRUE)
+df_16f_bis <- data.frame(rank = 1:length(counts_bc_16f_bis), counts = counts_bc_16f_bis)
+
+# Calcul du seuil de Cell Ranger pour l'affichage, pour voir leur choix. 
+seuil_cr_16f_bis <- min(seurat_filtered_16f_bis$nCount_RNA)
+
+# Tracer le graphe
+ggplot(df_16f_bis, aes(x = rank, y = counts)) +
+  geom_line(color ="black",size =1) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_hline(yintercept = seuil_cr_16f_bis, color = "red", linetype = "dashed") +
+  annotate("text", x = 10, y = 10000, label = "Cellules intactes", hjust = 0) +
+  annotate("text", x = 10^5, y = 10, label = "ARN dans le milieu / Gouttelettes vides", hjust = 0) +
+  scale_color_manual(name = "Seuils", values = c("Cell Ranger" = "red")) +
+  labs(
+    title = "Knee Plot (Données Brutes - 16 cell fixees bis)", 
+    subtitle = "Visualisation de la transition entre les cellules et le bruit de fond",
+    x = "Rang des Barcodes (Log10)", 
+    y = "Nombre d'UMIs (Log10)"
+  ) +
+  theme_minimal()
+```
+
+Ce graphique en échelle log-log, appelé *Knee Plot*, permet de valider la qualité de la capture cellulaire en visualisant la distribution des transcrits. On peut y distinguer trois zones principales :
+
+-   **Le plateau des cellules intactes (à gauche) :** La courbe commence à un niveau très élevé (autour de 100 000 UMIs, soit 1e+05) et décroît de manière très douce. Cette région représente les cellules qui ont été correctement capturées. Elles sont extrêmement riches en ARN, ce qui indique des cellules de très bonne qualité.
+
+-   **Le point d'inflexion ou « coude » (Knee) :** On observe une première chute abrupte juste après le rang 1 000 (1e+03), vers 2 000 - 3 000 barcodes. Cette décroissance brutale marque la transition entre le signal spécifique d'une cellule et le bruit de fond. Plus cette chute est raide, meilleure est la résolution de l'expérience.
+
+-   **La zone de l'ARN ambiant / gouttelettes vides (à droite) :** Après une brève stabilisation dans la zone de transition, la courbe plonge à nouveau vers les valeurs très basses. Il s'agit des gouttelettes vides qui ne capturent que l'ARN extracellulaire flottant dans le milieu, sans intérêt biologique pour l'analyse.
+
+On remarque que la ligne rouge de coupure générée par Cell Ranger est placée à environ 500 UMIs. Sur ce jeu de données de cellules fixées, l'algorithme a inclus la zone de transition et a coupé juste avant la chute finale vers l'ARN ambiant.
+
+Ainsi, nous pouvons baser nos seuils de filtrage initiaux sur l'observation de ce *Knee Plot* :
+
+-   **`nCount_RNA > 500`** : on conserve les barcodes présentant au moins 500 molécules d'ARN (alignement avec la ligne rouge).
+
+-   **`nFeature_RNA > 300`** : on ajoute un critère de complexité en conservant uniquement les barcodes exprimant au moins 300 gènes différents.
+
+## Filtrage de qualité
+
+En nous appuyant sur les seuils définis précédemment, nous procédons au filtrage des données brutes. J'ai choisi d'importer une nouvelle fois le fichier brut afin de conserver une trace intacte des données initiales d'un côté, et de disposer d'un objet de travail que je vais filtrer et transformer tout au long de ce document.
+
+-   **Chargement et premier filtrage des données brutes :**
+
+```{r}
+#| label: raw-data
+#| message: false
+#| warning: false
+# Chargement 
+data_dir_16f_bis <- "/Users/gege/Desktop/50-1319402224/10_cellranger_multi/urchin_lib2f_out/outs/per_sample_outs/sample4_OB4_F/sample_raw_feature_bc_matrix"
+raw.counts_16f_bis <- Read10X(data.dir = data_dir_16f_bis)
+
+
+# Création et premier filtre (Barcode Selection)
+seurat_obj_urchin_16f_bis <- CreateSeuratObject(counts = raw.counts_16f_bis, 
+                                 min.cells = 3, 
+                                 min.features = 400, 
+                                 project = "16 cell fixee_bis")
+
+seurat_obj_urchin_16f_bis <- subset(seurat_obj_urchin_16f_bis, 
+                     subset = nFeature_RNA > 300 & 
+                       nCount_RNA > 500)
+```
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: raw-data-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce premier filtre : 
+
+stats_16f_bis_1 <- data.frame(
+  "Type de données" = c("Brutes (Raw) premier filtrage",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin_16f_bis)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin_16f_bis$nFeature_RNA) )))
+print(stats_16f_bis_1)
+
+```
+
+Nous observeons une amélioration significative par rapport aux données brutes initiales. En effet, nous sommes passés de 920067 à 12154 codes-barres, avec une médiane de 629 gènes par cellule. Ce résultat démontre l'efficacité de la sélection des codes-barres et nous rapproche de notre objectif.
+
+Nous passons désormais à une étape importante : l'analyse du pourcentage d'ARN mitochondrial par cellule.
+
+-   **Contrôle du taux d'ARN mitochondrial** (viabilité des cellules) :
+
+En biologie cellulaire, un taux élevé d'ARN mitochondrial est souvent un indicateur de mauvaise viabilité. En effet, lorsque la membrane cytoplasmique d'une cellule est endommagée (lyse ou apoptose), l'ARN messager (ARNm) contenu dans le cytoplasme s'échappe. En revanche, les transcrits mitochondriaux, protégés par la double membrane de la mitochondrie, sont retenus plus longtemps ou cellule en stress du lors de la préparation des cellules par exemple.
+
+Si ce pourcentage est trop élevé (généralement supérieur à 5 % ou 10 %), cela signifie que la cellule est probablement morte ou mourante. Ces cellules doivent être exclues de l'analyse, car elles risqueraient de créer des artefacts lors du clustering et de fausser l'interprétation biologique.
+
+```{r}
+#| label: percent-mt
+#| message: false
+#| warning: false
+
+# On rajoute le pourcentage mitochondriale
+seurat_obj_urchin_16f_bis[["percent.mt"]] <- PercentageFeatureSet(seurat_obj_urchin_16f_bis, pattern = "^Mt") 
+# On affiche le pourcentage maximal dans nos cellules. 
+max(seurat_obj_urchin_16f_bis$percent.mt)
+min(seurat_obj_urchin_16f_bis$percent.mt)
+```
+
+Nous avons calculé le pourcentage d'ARN mitochondrial pour chaque cellule afin d'évaluer leur état de santé. En examinant la valeur maximale obtenue via la fonction max(), nous constatons que le taux le plus élevé n'atteint que 0.8333333 %.
+
+Ce résultat est nettement inférieur au seuil critique de 5 %. Cela indique que l'intégralité des cellules sélectionnées est de très bonne qualité et qu'aucune lyse cellulaire significative n'est à déplorer dans cet échantillon filtré.
+
+Et le pourcantage minimum est de 0%
+
+Maintenant nous allons regarder comment se comportent nos données pour venir affiner notre filtrage.
+
+-   **Visualisation de nos données :**
+
+```{r}
+#| label: data-visualisation 
+#| message: false
+#| warning: false
+VlnPlot(seurat_obj_urchin_16f_bis, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Le VlnPlot permet de visualiser le contrôle qualité avant filtrage. Il montre la distribution de trois métriques clés (`nFeature_RNA`, `nCount_RNA` et `percent.mt`) pour l'ensemble des gouttelettes capturées.
+
+-   **`nFeature_RNA` (Complexité) :** Il s'agit du nombre de gènes différents détectés par barcode, représentant la richesse du transcriptome. Loin d'être homogène, la distribution est très étalée. On observe une forte densité à la base du graphique (les gouttelettes vides ou débris de faible complexité), tandis que le signal des véritables cellules s'étire largement vers le haut. Quelques évènements extrêmes dépassent les 6 000 à 7 000 gènes ; il s'agit très probablement de doublets (plusieurs cellules encapsulées dans une même gouttelette) qu'il faudra exclure.
+
+-   **`nCount_RNA` (Quantité) :** C'est le nombre total de molécules d'ARN (UMIs) par barcode, indiquant la profondeur de capture. Ici encore, la distribution est extrêmement large, atteignant plus de 100 000 UMIs pour les points les plus hauts (une abondance caractéristique des blastomères précoces gorgés d'ARN maternels). Tout comme pour les gènes, la masse concentrée près de zéro représente le bruit de fond. Les valeurs extrêmes au sommet supérieur confirment la présence de doublets.
+
+-   **`percent.mt` (Viabilité / Qualité de fixation) :** Il indique le pourcentage de transcrits mitochondriaux. C'est le graphique le plus "propre" des trois. L'échelle maximale visible est de 1.00 %, et l'immense majorité des points se situe très en dessous de 0.50 %. Ce taux extrêmement faible confirme que les cellules n'ont pas souffert de lyse ou de stress majeur, validant l'excellente qualité de la préparation et de la fixation.
+
+-   **Filtrage de qualité optimisé** :
+
+L'objectif est de ne conserver que les cellules présentant superieure à 2000 gènes, seuils basés sur ce que nous avons observés plus haut. Pour le contrôle mitochondrial, nous avons choisi un seuil de 0.9 %.
+
+Ce choix se justifie par la qualité globale de l'échantillon : le taux maximal observé étant de 0.83 %, un seuil à 0.9 % permet d'exclure tout début de dégradation cellulaire tout en conservant l'intégralité des cellules saines. Cette étape n'est pas obligatoire mais il est plus sûr de la faire.
+
+```{r}
+#| label: data-filter-strict
+#| message: false
+#| warning: false
+seurat_obj_urchin_16f_bis <- subset(seurat_obj_urchin_16f_bis, 
+                     subset = nFeature_RNA > 2000 & 
+                               nCount_RNA > 20000 & 
+                              percent.mt < 0.9)
+
+
+VlnPlot(seurat_obj_urchin_16f_bis, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+Le résultat du filtrage montre une distribution des métriques de qualité beaucoup plus homogène. En appliquant nos seuils de sélection, notamment en conservant un nombre de gènes superieur à 2 000 et en plafonnant le taux mitochondrial à un niveau extrêmement bas (inférieur à 0.9%), nous avons nettoyé le jeu de données de son bruit de fond. Ces données, désormais débarrassées des débris et des cellules en souffrance, constituent une base très solide pour l'étape de détection des doublets qui peuvent être restés.
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: data-filtered-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce deuxième filtrage : 
+
+stats_16f_bis_2 <- data.frame(
+  "Type de données" = c("Filtrées optimisées",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin_16f_bis)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin_16f_bis$nFeature_RNA) )))
+print(stats_16f_bis_2)
+
+```
+
+## Normalisation, réduction de dimension et clustering
+
+-   **Normalisation**
+
+Ici nous normalisons avant l'étape Doubletfinder car il crée des "cellules artificielles" en mélangeant les profils d'expression de nos vraies cellules. Pour que ce mélange mathématique fonctionne, il faut que toutes les cellules soient sur la même échelle de mesure, d'où l'interêt de la normalisation.
+
+```{r}
+#| label: sctransform-pca
+#| message: false
+#| warning: false
+
+# SCTransform fait tout : Normalisation, Scaling et sélection des gènes variables 
+# On précise variable.features.n = 3000 
+seurat_obj_urchin_16f_bis <- SCTransform(seurat_obj_urchin_16f_bis, 
+                          method = "glmGamPoi", 
+                          variable.features.n = 2000, 
+                          verbose = FALSE)
+
+#On lance la PCA directement après
+seurat_obj_urchin_16f_bis <- RunPCA(seurat_obj_urchin_16f_bis, verbose = FALSE)
+
+```
+
+**SCTransform** : est une méthode qui utilise un modèle de régression (Gamma-Poisson) pour stabiliser la variance et corriger les effets de profondeur de séquençage. Elle offre une meilleure définition des gènes hautement variables (ici, les 2 000 gènes les plus informatifs) par rapport aux méthodes de normalisation logarithmiques classiques. Cette étape est importante pour la réduction de dimension (PCA) et la détection des doublets.
+
+**PCA** : l'analyse en composantes principales permet de réduire la complexité de milliers de gène en quelques axes mathématiques (les PC), en général les premières composantes capturent les variations biologiques les plus fortes.
+
+Une fois la normalisation par SCTransform effectuée, nous avons réalisé une Analyse en Composantes Principales (PCA). L'objectif est maintenant d'identifier les composantes principales (PC) qui expliquent le mieux la variance observée dans nos données. Déterminer le nombre optimal de PC est donc essentiel pour que DoubletFinder puisse comparer efficacement les vraies cellules aux doublets simulés.
+
+-   **Réduction de dimension**
+
+```{r}
+#| label: composantes-principales
+#| message: false
+#| warning: false
+
+# On visualise quels sont les axes qui explique le plus la variance : 
+ElbowPlot(seurat_obj_urchin_16f_bis) + 
+  labs(
+    x = "PC (Composantes Principales)", 
+    y = "Écart-type (Standard Deviation)",
+    title = "Détermination du nombre de PC (Elbow Plot) 16 cell fixées bis"
+  ) +
+  theme_classic()
+# On voit qu'on a un coude au niveau de 5-10
+# On garde les 10 premiers axes mais selon ce qu'on va observé avec les clusters par la suite on pourrait baisser le nombre de PC (À 7 par exemple)
+
+```
+
+L'examen de l'Elbow Plot révèle un coude situé entre les PC 5 et 10. Pour la suite de l'analyse, nous choisissons de conserver les 10 premières composantes principales, car elles capturent l'essentiel de la structure biologique de l'échantillon. Il sera toutefois intéressant, lors des étapes de clustering, de tester différentes résolutions et un nombre d'axes réduit afin d'observer la stabilité des clusters.
+
+-   **Clustering et UMAP**
+
+Afin d'optimiser la détection par DoubletFinder, nous allons réaliser une première réduction de dimension (UMAP) et un clustering préliminaire. Le clustering est nécessaire car l'algorithme s'appuie sur la structure locale des données et les identités des clusters pour modéliser les doublets artificiels. La UMAP n'a pas d'intérêt, à part juste une première visualisation.
+
+```{r}
+#| label: clustering-UMAP
+#| message: false
+#| warning: false
+seurat_obj_urchin_16f_bis <- RunUMAP(seurat_obj_urchin_16f_bis, dims = 1:10)
+seurat_obj_urchin_16f_bis <- FindNeighbors(seurat_obj_urchin_16f_bis, dims = 1:10)
+seurat_obj_urchin_16f_bis <- FindClusters(seurat_obj_urchin_16f_bis, resolution = 0.5)
+```
+
+**RunUMAP** : Cette fonction génère une projection non linéaire en 2D de nos 10 composantes principales. L'UMAP permet de visualiser la proximité entre les cellules : plus deux points sont proches sur le graphique, plus leur profil d'expression génique est similaire.
+
+**FindNeighbors** : Calcule un graphe de voisinage. Pour chaque cellule, l'algorithme cherche ses "voisins" les plus proches dans l'espace de la PCA. C'est la base mathématique nécessaire au partitionnement des données.
+
+**FindClusters** : C'est l'étape de regroupement proprement dite. Nous utilisons ici une résolution de 0,5, qui est une valeur standard pour un jeu de données de cette taille,c'est une valeur par défaut mais nous nous y interresserons de plus prêt plus tard.
+
+Ce clustering est temporaire, mais nous voyons que nous avons 6 clusters préliminaires.
+
+```{r}
+#| label: UMAP
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin_16f_bis, reduction = "umap", label = TRUE) + 
+  ggtitle("UMAP préliminaire (avant DoubletFinder) 16 cell fixées bis")
+```
+
+Maintenant que nos clusters préliminaires sont définis, nous pouvons préparer l'exécution de DoubletFinder. Une étape importante avant le lancement de l'algorithme est le calcul de la proportion homotypique.
+
+## Calcul de la proportion homotypique et des paramètres de DoubletFinder
+
+Les doublets homotypiques correspondent à la fusion de deux cellules de même type (provenant du même cluster). Ces doublets sont biologiquement moins gênants car ils ne créent pas de "faux" types cellulaires, contrairement aux doublets hétérotypiques (mélange de deux types différents). En estimant cette proportion, nous pouvons affiner le nombre attendu de doublets à exclure pour ne cibler que les plus problématiques.
+
+-   **Proportion homotypique**:
+
+https://cdn.10xgenomics.com/image/upload/v1722285481/support-documents/CG000315_ChromiumNextGEMSingleCell3\_\_GeneExpression_v3.1_DualIndex\_\_RevF.pdf
+
+```{r}
+#| label: proportion-homotypique
+#| message: false
+#| warning: false
+
+# Calcul de la proportion homotypique basée sur les clusters (résolution 0.5)
+# Cela estime la probabilité que deux cellules d'un doublet viennent du même cluster.
+homotypic.prop_16f_bis <- modelHomotypic(seurat_obj_urchin_16f_bis@active.ident) 
+
+# Définition du taux de multiplets attendu 
+# La règle générale, basée sur la documentation officielle de 10x Genomics, est une augmentation d'environ 0,8 % du taux de multiplets par tranche de 1 000 cellules récupérées (soit environ 0,000008 par cellule). Ici on a 1206 cellules donc : 2541 * 0.000008 = 0.020328
+expected_rate_16f_bis <- 0.020
+nExp_poi_16f_bis <- round(expected_rate_16f_bis * ncol(seurat_obj_urchin_16f_bis)) 
+nExp_poi_16f_bis
+# Ajustement du nombre final de doublets à détecter
+# On retire les doublets homotypiques car ils sont indifférenciables des singlets au niveau de l'expression génique.
+nExp_final_16f_bis <- round(nExp_poi_16f_bis * (1 - homotypic.prop_16f_bis))
+nExp_final_16f_bis
+
+```
+
+La comparaison entre le nombre théorique de doublets attendus 51 et le nombre final calculé après ajustement homotypique 41 montre une cohérence. Cette légère différence s'explique par le fait que nous avons soustrait les doublets dits « homotypiques ». Comme ces doublets sont formés par deux cellules de même type, leur profil d'expression reste propre et ne crée pas de faux clusters. En ciblant uniquement les 41 doublets hétérotypiques, nous nous concentrons sur les artefacts qui pourraient fausser l'identification des lignages cellulaires.
+
+La prochaine étape consiste à calibrer les paramètres de l'algorithme DoubletFinder
+
+-   **Définition des paramètres de DoubletFinder**
+
+L'objectif est d'identifier précisément les "doublets" (deux cellules capturées dans une seule gouttelette) qui subsistent dans notre échantillon.
+
+```{r}
+options(future.globals.maxSize = 15000 * 1024^2)
+
+plan("sequential") # Désactive le multi-cœur pour économiser la RAM physique
+#j'ai rajouté cette étape car mon ordinateur avait du mal a faire le travail 
+```
+
+```{r}
+#| label: parametres-doubletfinder
+#| message: false
+#| warning: false
+
+# Simulation des doublets et balayage des paramètres :
+# On utilise les 10 PC
+sweep.res.list_16f_bis <- paramSweep(seurat_obj_urchin_16f_bis, PCs = 1:10, sct = TRUE)
+
+# Résumé des statistiques du balayage
+sweep.stats_16f_bis <- summarizeSweep(sweep.res.list_16f_bis, GT = FALSE)
+
+# Calcul du pK optimal, réglage du filet
+bcmvn_16f_bis <- find.pK(sweep.stats_16f_bis)
+
+```
+
+Pour finaliser la configuration de DoubletFinder, nous avons analysé la distribution du coefficient de bimodalité (BCmetric) en fonction du paramètre pK. Le graphique présente un pic distinct, identifiant la valeur de pK pour laquelle la séparation entre les singlets et les doublets artificiels est maximale.
+
+L'utilisation de ce pK optimal permet d'ajuster la sensibilité du filet de détection, garantissant ainsi que les 41 doublets identifiés précédemment correspondent à des artefacts réels et non à une variation biologique naturelle.
+
+```{r}
+#| label: extraction-du-pk-optimal
+#| message: false
+#| warning: false
+
+# Extraction du pK optimal
+pK_opt_16f_bis <- as.numeric(as.character(bcmvn_16f_bis$pK[which.max(bcmvn_16f_bis$BCmetric)]))
+print(paste("Le pK optimal identifié est :", pK_opt_16f_bis))
+
+#Le paramètre pK représente la "finesse" ou le voisinage (PC neighborhood size) utilisé pour cette comparaison.
+```
+
+## DoubletFinder
+
+Le paramètrage de doubletfinder fait, nous pouvons lancer la detection des doublets.
+
+-   **Detection des doublets** :
+
+```{r}
+#| label: detection-des-doublets
+#| message: false
+#| warning: false
+# On s'assure que l'objet est bien préparé
+
+seurat_obj_urchin_16f_bis <- doubletFinder(
+  seu = seurat_obj_urchin_16f_bis, 
+  PCs = 1:10, 
+  pN = 0.25, 
+  pK = pK_opt_16f_bis,        # On utilise la valeur optimale du graphique
+  nExp = nExp_final_16f_bis, 
+  sct = TRUE          # Indispensable avec SCTransform
+)
+
+class_col_16f_bis <- grep("DF.classifications", colnames(seurat_obj_urchin_16f_bis@meta.data), value = TRUE)
+
+# Vérification des colonnes
+message(paste("Doublets identifiés dans la colonne :", class_col_16f_bis))
+print(class_col_16f_bis)
+```
+
+Nous avons exécuté l'algorithme DoubletFinder en utilisant le pK optimal identifié précédemment. Cette étape compare chaque cellule réelle à des doublets artificiels générés par simulation.
+
+L'algorithme a indiqué les 91 cellules comme étant des doublets hétérotypiques. Cela nous permettra, dans l'étape suivante, de visualiser la localisation de ces doublets sur notre UMAP avant de procéder à leur élimination définitive.
+
+-   **Visualisation des doublets**
+
+```{r}
+#| label: visualisation-des-doublets
+#| message: false
+#| warning: false
+# Visualisation :On affiche les doublets détectés en rouge sur l'UMAP.
+DimPlot(seurat_obj_urchin_16f_bis, group.by = class_col_16f_bis, cols = c("Singlet" = "black", "Doublet" = "red")) +
+  ggtitle("Doublets identifiés (en rouge)")
+```
+
+L'affichage de la projection UMAP permet de confirmer la pertinence de l'identification. La détection étant validée, nous procédons désormais à la suppression définitive de ces doublets pour ne conserver que les singlets (cellules uniques) pour la suite de l'analyse. La suppression de ces 91 cellules n'est pas une perte, mais un gain de précision.
+
+-   **Suppression des doublets** :
+
+```{r}
+#| label: suppression-des-doublets
+#| message: false
+#| warning: false
+# Suppression définitive des doublets pour ne garder que les "Singlets" (vraies cellules).
+seurat_obj_urchin_16f_bis <- subset(seurat_obj_urchin_16f_bis, subset = !!sym(class_col_16f_bis) == "Singlet")
+DimPlot(seurat_obj_urchin_16f_bis, group.by = class_col_16f_bis, cols = c("Singlet" = "black", "Doublet" = "red")) +
+  ggtitle("Doublets identifiés (en rouge)")
+```
+
+Une fois l'étape de suppression des doublets réalisée, nous pouvons passer au clustering final de nos cellules. Toutefois, avant de fixer un nombre définitif de cluster, nous allons explorer différentes résolutions pour identifier la plus optimale. Cette démarche nous permettra de choisir le niveau le plus stable et le plus cohérent d'un point de vue biologique.
+
+## Analyse de la résolution et arbre de clustering
+
+Avant de fixer une partition définitive des populations cellulaires, nous testons différentes résolutions allant de 0,1 à 1,0 avec un pas de 0,1.
+
+L'objectif est de déterminer quelle résolution reflète le mieux la réalité biologique. Une résolution trop faible masquerait la diversité des types cellulaires (sous-clustering), tandis qu'une résolution trop élevée pourrait diviser artificiellement des populations homogènes en créant des clusters sans signification biologique (sur-clustering). L'utilisation d'un arbre de clustering (clustree) nous permettra d'observer la stabilité de ces divisions.
+
+-   **Test de résolution** :
+
+```{r}
+#| label: test-de-resolution
+#| message: false
+#| warning: false
+res_to_test_16f_bis <- seq(0.1, 1, by = 0.1)
+seurat_obj_urchin_16f_bis <- FindClusters(seurat_obj_urchin_16f_bis, resolution = res_to_test_16f_bis)
+```
+
+-   **Arbre de clustering** :
+
+```{r}
+#| label: clustering-tree 
+#| message: false
+#| warning: false
+# Arbre de clustering
+print(clustree(seurat_obj_urchin_16f_bis, prefix = "SCT_snn_res."))
+```
+
+**Flèches** : les flèches droites indiquent que les clusters sont bien définis et que les cellules ne sautent pas d'un groupe à l'autre.
+
+Notre jeu de données semble très robuste. Les populations cellulaires sont distinctes et ne se mélangent pas, même quand nous augmentons la résolution.
+
+*À basse résolution (0.1 à 0.3)* : On voit le cluster rouge (0) se diviser en trois (0, 1, 3 en orange). 3 Feuillets embryonnaires ?
+
+*À haute résolution (0.7 à 1.0)* : On commence à voir des flèches qui se croisent, notamment sur la gauche (entre les clusters bleus et violets). C'est le signe que l'algorithme essaie de diviser des populations qui sont très proches biologiquement.
+
+Ici une bonne résolution serait entre 0.4 et 0.5, nous avons des clusters bien nets, qui ont l'air bien stables.
+
+Pour la suite ""du clustering final"", nous avons opté pour une résolution de 0.5. Ce choix s'appuie sur la stabilité observée dans l'arbre de clustering (clustree) à ce niveau. Cette résolution permet d'identifier les principales populations cellulaires de manière robuste, tout en conservant la flexibilité nécessaire pour affiner ou ajuster ce paramètre ultérieurement si l'identification de sous-types cellulaires plus précis l'exige.
+
+## Clustering Final
+
+-   **Calcul des clusters finaux** :
+
+```{r}
+#| label: clustering-final 
+#| message: false
+#| warning: false
+#| # On recalcule les clusters sur les données propres.
+seurat_obj_urchin_16f_bis <- FindNeighbors(seurat_obj_urchin_16f_bis, dims = 1:10)
+seurat_obj_urchin_16f_bis <- FindClusters(seurat_obj_urchin_16f_bis, resolution = 0.4) # Groupe les cellules par types
+seurat_obj_urchin_16f_bis <- RunUMAP(seurat_obj_urchin_16f_bis, dims = 1:10)
+seurat_obj_urchin_16f_bis <- RunTSNE(seurat_obj_urchin_16f_bis, dims = 1:10)
+
+```
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: data-final-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce dernier filtrage : 
+
+stats_16f_bis_3 <- data.frame(
+  "Type de données" = c("Filtrées optimisées",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin_16f_bis)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin_16f_bis$nFeature_RNA) )))
+print(stats_16f_bis_3)
+
+```
+
+## Visualisations Finales
+
+-   **UMAP** :
+
+```{r}
+#| label: umap
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin_16f_bis, reduction = "umap", label = TRUE) + ggtitle("UMAP Finale (Singlets uniquement)16 cell fixées bis")
+```
+
+-   **TSNE** :
+
+```{r}
+#| label: tsne
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin_16f_bis, reduction = "tsne", label = TRUE) + ggtitle("TSNE Finale (Singlets uniquement)16 cell fixées bis")
+```
+
+## Indentifictaion des Clusters
+
+-   **Nombre de gènes par cluster** :
+
+```{r}
+print(table(Idents(seurat_obj_urchin_16f_bis)))
+```
+
+-   **Identification des gènes exprimés** **différentiellement** :
+
+```{r}
+# Identification des gènes marqueurs : Quels gènes sont spécifiques à chaque groupe ?
+all_markers_16f_bis <- FindAllMarkers(seurat_obj_urchin_16f_bis, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.50) # on veut que les gènes surexprimés, présent dans au moins 25% des cellules avec une dif d'expression d'au moins 0,25
+# Tableau récapitulatif du nombre de cellules par cluster
+print(table(Idents(seurat_obj_urchin_16f_bis)))
+```
+
+-   **Extraction des gènes marqueurs** :
+
+```{r}
+top40_16f_bis<- all_markers_16f_bis %>% group_by(cluster) %>% top_n(n = 40, wt = avg_log2FC)
+print(top40_16f_bis)
+```
+
+-   **Enregistrement des listes des 40 premiers gènes par clusters** :
+
+```{r}
+# Définissions du chemin 
+#
+#chemin_bureau <- "~/Desktop/Resultats_Analyse_16_cell_fixees_bis"
+
+#for (i in 0:6) {
+  
+  # Filtrer les gènes pour le cluster actuel
+  #current_cluster_genes_16f_bis <- all_markers_16f_bis[all_markers_16f_bis$cluster == i, ]
+  
+  # Extraire les 40 meilleurs
+ #top40_16f_bis <- head(current_cluster_genes_16f_bis, 40)
+  
+  # Afficher
+  #cat("\n--- Top 40 pour le Cluster", i, "---\n")
+  #print(head(top40_16f_bis, 40)) 
+  
+  # Sauvegarder le fichier CSV 
+  #nom_fichier <- paste0(chemin_bureau, "/marqueurs_cluster", i, "_40g.csv")
+  #write.csv(top40_16f_bis, file = nom_fichier, row.names = FALSE)
+  
+#}
+```
+
+Pour enregistrer tout ce que j'ai fais :
+
+```{r}
+# Créer le dossier sur le bureau
+#dir.create("~/Desktop/Resultats_Analyse_16_cell_fixees_bis", recursive = TRUE, showWarnings = FALSE)
+
+# Sauvegarder l'objet
+#saveRDS(seurat_obj_urchin_16f_bis, file = "~/Desktop/Resultats_Analyse_16_cell_fixees_bis/seurat_final.rds")
+```
+
+Pour tous les gènes ?
+
+```{r}
+# Définition du chemin vers ton Bureau
+#chemin_bureau <- "~/Desktop/Resultats_Analyse_16_cell_fixees_bis"
+
+# Créer le dossier s'il n'existe pas encore
+#if (!dir.exists(chemin_bureau)) {
+  #dir.create(chemin_bureau)
+#}
+
+#for (i in 0:6) {
+  
+  # 1. Filtrer les gènes spécifiquement pour le cluster i
+  # On s'assure que la colonne s'appelle bien 'cluster'
+ # current_cluster_genes_16f_bis <- all_markers_16f_bis[all_markers_16f_bis$cluster == i, ]
+  
+  # 2. Définir le nom du fichier dynamiquement
+ # nom_fichier <- paste0(chemin_bureau, "/marqueurs_cluster", i, "_all.csv")
+  
+  # 3. SAUVEGARDER l'objet filtré (current_cluster_genes) et non la table entière
+  #write.csv(current_cluster_genes_16f_bis, file = #nom_fichier, row.names = FALSE)
+  
+#}
+```
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin_16f_bis, features = "Nodal")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin_16f_bis, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin_16f_bis, features = "Nodal")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin_16f_bis, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Nodal")
+```
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin_16f_bis, features = "Pmar1a")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin_16f_bis, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin_16f_bis, features = "Pmar1a")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin_16f_bis, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Pmar1a")
+```
