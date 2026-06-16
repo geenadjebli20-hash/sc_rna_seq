@@ -1,0 +1,1583 @@
+---
+title: "Traitement_données_scRNAseq_pilote_MB_stage"
+author: "Geena Djebli"
+format: html
+editor: visual
+---
+
+## Filtrage, Doubletfinder et clustering
+
+Ce pipeline vise à filtrer les données de séquençage d’ARN en *single-cell RNA-seq* obtenues chez l’oursin au stade **Mesenchyme Blastula (MB)**. Les données utilisées sont issues de l’alignement des reads brutes via le pipeline automatisé "**Cell Ranger"** (se référer à la partie Cell Ranger).
+
+Deux jeux de données sont traités ici : le fichier déjà filtré par Cell Ranger et le fichier brut (« raw »). Ce dernier sera filtré manuellement dans ce document afin de comparer nos résultats à ceux fournis par l'outil automatisé. Effectuer son propre filtrage permet de choisir la finnesse des ses filtres, et mieux comprendre ce qui se passe.
+
+## Étape préliminaire
+
+**Configuration de l'environnement :**
+
+Dans un premier temps, il est nécessaire d'installer les packages qui seront utilisés pour l'analyse. Cette installation n'est à effectuer qu'une seule fois sur la machine. Par la suite, il suffira de charger les bibliothèques (libraries) au début de chaque session pour accéder aux outils et fonctions requis.
+
+-   **Instalation packages** (à faire qu'une fois) :
+
+```{r}
+#| label: setup-libraries
+#| message: false
+#| warning: false
+
+# Installation des packages si nécessaire
+# install.packages(c("Seurat", "SeuratObject", "remotes", "clustree")) 
+# Pour les lancer il faut enlever le "#" devant. 
+```
+
+**Seurat & SeuratObject** : il s'agit de bibliothèques de références pour l'analyse de données en Single Cell. Seurat fournit les algorithmes de normalisation, de réduction de dimension (PCA, UMAP) et de clustering. SeuratObject définit la structure de données qui stocke de manière optimisée les matrices d'expression et les métadonnées des cellules.
+
+**remotes** : ce package permet d'installer des outils qui ne sont pas ""encore"" sur les dépôts officiels (CRAN), mais disponibles directement sur des plateformes comme GitHub.
+
+**clustree** : cet outil de visualisation est utilisé pour évaluer la ""stabilité "" des clusters. Il permet de construire un "arbre de clustering" afin de visualiser comment les cellules se répartissent entre les différents groupes lorsque l'on fait varier la résolution de l'analyse.
+
+-   **Chargement des bibliothèques** :
+
+```{r}
+#| label: load-libraries
+#| message: false
+#| warning: false
+
+library(Seurat)
+library(DoubletFinder)
+library(dplyr)
+library(ggplot2)
+library(future)
+library(clustree)
+
+```
+
+**Analyse Single-Cell et Contrôle Qualité :**
+
+**Seurat** : L'outil principale utilisé pour l'analyse des données de Single Cell.
+
+**DoubletFinder** : Un package qui permet de détecter et exclure les "doublets" (deux cellules capturées dans une seule gouttelette), ce qui évite les artefacts d'expression dans l'analyse.
+
+**Manipulation et Calcul :**
+
+**dplyr** : permet de filtrer les métadonnées ou réorganiser les tableaux de comptage.
+
+**future** : utilisé pour activer le calcul en parallèle. Cela permet d'accélérer considérablement les étapes gourmandes en ressources (comme l'analyse de voisinage ou le clustering) en utilisant plusieurs cœurs de votre processeur, purement informatique, pour bien exploiter l'appareil utilisé.
+
+**Visualisation et Validation :**
+
+**ggplot2** : permet de créer des figures sur mesure et de haute qualité.
+
+**clustree** : il sert à visualiser la ""stabilité"" du partitionnement des cellules selon différentes résolutions. Voir le comportement des clusters.
+
+-   **Configuration mémoire** :
+
+```{r}
+#| label: memory-config
+#| echo: true
+#| message: false
+#| warning: false
+
+# Augmente la limite de taille ""de quoi?""  (mémoire) pour le calcul parallèle (16 Go)
+options(future.globals.maxSize = 15000 * 1024^2)
+
+# Utiliser les coeurs disponibles
+# Cela permet d'accélérer Seurat 
+plan("multisession", workers = parallel::detectCores() - 1)
+
+```
+
+## Comparaison des données brutes (raw) et filtrées (filtered)
+
+Une fois l'environnement de travail configuré pour le traitement et l'analyse, nous procédons à l'importation des jeux de données. L'objectif est de comparer les données brutes aux données filtrées par Cell Ranger afin d'évaluer la qualité initiale de l'échantillon et la pertinence du filtrage automatisé.
+
+-   **Importation des données** (brutes et filtrées)
+
+```{r}
+#| label: load-datas 
+#| message: false
+#| warning: false
+
+# Charger les données brutes (Raw)
+raw_data <- Read10X(data.dir = "/Users/gege/Desktop/raw_feature_bc_matrix")# ici il faut mettre le chemin des fichiers sur l'ordi où est ""lancé"" le pipline
+seurat_raw <- CreateSeuratObject(counts = raw_data, project = "Raw_Data")
+
+# Charger les données filtrées par Cell Ranger (Filtered)
+filtered_data <- Read10X(data.dir = "/Users/gege/Desktop/filtered_feature_bc_matrix")
+seurat_filtered <- CreateSeuratObject(counts = filtered_data, project = "Filtered_Data")
+
+```
+
+**Raw Feature BC Matrix** : Contient l'intégralité des codes-barres (barcodes) détectés, y compris ceux correspondant à des gouttelettes vides ou contenant uniquement de l'ARN dans le milieu. C'est notre point de départ pour un filtrage personnalisé.
+
+**Filtered Feature BC Matrix** : Ce jeu de données a déjà subi le filtrage automatisé de Cell Ranger, qui utilise un algorithme pour ne conserver que les gouttelettes considérées comme de "vraies" cellules.(Se doccumenter dessus pour bien comprendre) ""que fait cellranger comme filtrage?""
+
+-   **Comparaison**
+
+```{r}
+#| label: compare-data
+#| message: false
+#| warning: false
+
+# Comparaison du nombre de cellules :
+stats <- data.frame(
+  "Type de données" = c("Brutes (Raw)", "Filtrées (Cell Ranger)"),
+  "Nombre de Barcodes" = c(ncol(seurat_raw), ncol(seurat_filtered)),
+  "Médiane Gènes/Cellule" = c(median(seurat_raw$nFeature_RNA), median(seurat_filtered$nFeature_RNA)),
+  check.names = FALSE 
+)
+print(stats)
+
+```
+
+L'écart entre les données brutes et les données filtrées par Cell Ranger met en évidence l'importance de l'étape de nettoyage.
+
+**Données Brutes (Raw)** : On observe un nombre ""impressionant"" de codes-barres (1 672 422). Cependant, la médiane du nombre de gènes par cellule est de 0. Cela indique que l'immense majorité de ces codes-barres correspond à des gouttelettes vides, à des débris cellulaires ou à du bruit de fond ne contenant aucune information biologique exploitable. On choisi la médiane ici, car elle est plus représentative que la moyenne.
+
+**Données Filtrées (Cell Ranger)** : Après le filtrage de Cell Ranger, le jeu de données est réduit à 6 348 cellules potentielles. Pour ces dernières, la médiane s'élève à 2 266 gènes par cellule, ce qui témoigne d'une bonne profondeur de séquençage et de la capture de bonnes cellules.
+
+Le pipeline Cell Ranger a éliminé une grande majorité des codes-barres initiaux. Ce filtrage fort est normal : il permet de passer de données immenses et bruitées à un jeu de données exploitable composé uniquement de véritables cellules.
+
+""En premier, il faut éliminer le bruit de fond (donné par les billes vides)""
+
+## La sélection des barcodes
+
+Après avoir comparé les données brutes aux résultats de Cell Ranger, nous débutons le processus de filtrage manuel. La première étape commence dans la sélection des codes-barres (barcodes). Cette analyse permet de définir un seuil de coupure afin de distinguer les véritables cellules des gouttelettes vides ou des débris, permettant ainsi un premier filtrage.
+
+```{r}
+#| label: selection-barcodes
+#| message: false
+#| warning: false
+
+# Préparation des données
+counts_bc <- sort(seurat_raw$nCount_RNA, decreasing = TRUE)
+df <- data.frame(rank = 1:length(counts_bc), counts = counts_bc)
+
+# Calcul du seuil de Cell Ranger pour l'affichage, pour voir leur choix. 
+seuil_cr <- min(seurat_filtered$nCount_RNA)
+
+# Tracer le graphe
+ggplot(df, aes(x = rank, y = counts)) +
+  geom_line(color ="black",size =1) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_hline(yintercept = seuil_cr, color = "red", linetype = "dashed") +
+  annotate("text", x = 10, y = 10000, label = "Cellules intactes", hjust = 0) +
+  annotate("text", x = 10^5, y = 10, label = "ARN dans le milieu / Gouttelettes vides", hjust = 0) +
+  scale_color_manual(name = "Seuils", values = c("Cell Ranger" = "red")) +
+  labs(
+    title = "Knee Plot (Données Brutes - Oursin MB)", 
+    subtitle = "Visualisation de la transition entre les cellules et le bruit de fond",
+    x = "Rang des Barcodes (Log10)", 
+    y = "Nombre d'UMIs (Log10)"
+  ) +
+  theme_minimal()
+```
+
+Ce graphique en échelle log-log nous permet de valider la qualité de la capture cellulaire. On peut y distinguer trois zones :
+
+-   Le Plateau des cellules (à gauche) : la courbe commence très haut (au-dessus de 10 000 UMIs) et descend doucement. Cela représente les cellules qui ont été correctement capturées. Elles sont riches en ARN, ce qui indique des cellules de bonne qualité.
+
+-   Le "coude" : On voit une décroissance aux alentours de 1e+03,environ 6 000/7 000 barcodes . Cette chute signifie qu'il y a une différence entre le contenu d'une cellule et le bruit de fond "" Vrai aussi dans le cas précédent"". Plus cette chute est raide, meilleure est la qualité de l'expérience.
+
+-   La zone de l'ARN dans le milieu/goutelletes vides (à droite) : après la chute, la courbe se stabilise rapidement mais très peu de temps puis retombe à nouveau. C'est des gouttelettes qui ne contiennent que quelques molécules d'ARN qui flottaient dans la solution, donc des goutellettes pas ""forcément"" interessantes.
+
+On remarque que la ligne rouge de Cell Ranger (environ 500 UMIs) est placée juste après le premier coude. Il a donc été plutôt prudent. Il a coupé pile au moment où la courbe commence à tomber.
+
+Ainsi on peut basé nos seuils sur les observations du Knee Plot : - nFeature_RNA \> 300 : on garde les barcodes avec au moins 300 gènes - nCount_RNA \> 500 : on garde les barcodes avec au moins 500 molécules (ligne rouge)
+
+## Filtrage de qualité
+
+En nous appuyant sur les seuils définis précédemment, nous procédons au filtrage des données brutes. J'ai choisi d'importer une nouvelle fois le fichier brut afin de conserver une trace intacte des données initiales d'un côté, et de disposer d'un objet de travail que je vais filtrer et transformer tout au long de ce document.
+
+-   **Chargement et premier filtrage des données brutes :**
+
+```{r}
+#| label: raw-data
+#| message: false
+#| warning: false
+# Chargement 
+data_dir <- "/Users/gege/Desktop/raw_feature_bc_matrix"
+raw.counts <- Read10X(data.dir = data_dir)
+
+
+# Création et premier filtre (Barcode Selection)
+seurat_obj_urchin <- CreateSeuratObject(counts = raw.counts, 
+                                 min.cells = 3, 
+                                 min.features = 300, 
+                                 project = "Oursin_pilot")
+
+```
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: raw-data-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce premier filtre : 
+
+stats_1 <- data.frame(
+  "Type de données" = c("Brutes (Raw) premier filtrage",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin$nFeature_RNA) )))
+print(stats_1)
+
+```
+
+Nous observeons une amélioration significative par rapport aux données brutes initiales. En effet, nous sommes passés de 1 672 422 ""codes-barres à 6 743 cellules sélectionnées"" ""atention au changement de nom"", avec une médiane de 2 204 gènes par cellule. Ce résultat démontre l'efficacité de la sélection des codes-barres et nous rapproche de notre objectif.
+
+Nous passons désormais à une étape importante : l'analyse du pourcentage d'ARN mitochondrial par cellule.
+
+-   **Contrôle du taux d'ARN mitochondrial** (viabilité des cellules) :
+
+En biologie cellulaire, un taux élevé d'ARN mitochondrial est souvent un indicateur de mauvaise viabilité. En effet, lorsque la membrane cytoplasmique d'une cellule est endommagée (lyse ou apoptose), l'ARN messager (ARNm) contenu dans le cytoplasme s'échappe. En revanche, les transcrits mitochondriaux, protégés par la double membrane de la mitochondrie, sont retenus plus longtemps. "" ou cellule en stress du lors de la préparation des cellules par exemple""
+
+Si ce pourcentage est trop élevé (généralement supérieur à 5 % ou 10 %), cela signifie que la cellule est probablement morte ou mourante. Ces cellules doivent être exclues de l'analyse, car elles risqueraient de créer des artefacts lors du clustering et de fausser l'interprétation biologique.
+
+```{r}
+#| label: percent-mt
+#| message: false
+#| warning: false
+
+# On rajoute le pourcentage mitochondriale
+seurat_obj_urchin[["percent.mt"]] <- PercentageFeatureSet(seurat_obj_urchin, pattern = "^Mt") 
+# On affiche le pourcentage maximal dans nos cellules. 
+max(seurat_obj_urchin$percent.mt)
+min(seurat_obj_urchin$percent.mt)
+```
+
+Nous avons calculé le pourcentage d'ARN mitochondrial pour chaque cellule afin d'évaluer leur état de santé. En examinant la valeur maximale obtenue via la fonction max(), nous constatons que le taux le plus élevé n'atteint que 1,45 %.
+
+Ce résultat est nettement inférieur au seuil critique de 5 %. Cela indique que l'intégralité des cellules sélectionnées est de très bonne qualité et qu'aucune lyse cellulaire significative n'est à déplorer dans cet échantillon filtré.
+
+""Et le pourcantage minimum? -\> 0%
+
+Séquence faites à partir de cellules ou de noyaux?
+
+Connaitre la préparation des échantillons est important""
+
+Maintenant nous allons regarder comment se comportent nos données pour venir affiner notre filtrage.
+
+-   **Visualisation de nos données :**
+
+```{r}
+#| label: data-visualisation 
+#| message: false
+#| warning: false
+VlnPlot(seurat_obj_urchin, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Le VlnPlot permet de visualiser le contrôle qualité. Il montre la distribution de trois métriques clés (nFeature_RNA,nCount_RNA et percent.mt) pour les cellules.
+
+**nFeature_RNA** : c'est le nombre de gènes par cellule, il représente la richesse génétique des cellules. La majorité des cellules se situe autour de 2 200 gènes, c'est très homogène. Il y a quelques points isolés tout en haut (au dessus de 6 000 gènes) ; ce sont peut-être des doublets (deux cellules dans une gouttelette), nous allons les filtrer par la suite.
+
+**nCount_RNA** : c'est le nombre de molécules d'ARN par UMIs, il représente la profondeur de séquençage. La majorité des cellules est concentrée en bas (autour de 5 000 - 10 000 UMIs), mais il y quelques points qui monte jusqu'à 50 000. Ces points confirment l'idée de la présence de doublets. Si une cellule a 50 000 molécules alors que la moyenne est à 5 000, il est fort probable qu'il y ait plusieurs cellules dans cette gouttelette.
+
+**percent.mt** : c'est le pourcentage mitochondrial, il indique la viabilité des cellules. C'est le graphique le plus "propre" des trois. L'échelle s'arrête à 1.5 %, et la grande majorité des cellules est en dessous de 0.5 %. Ainsi nous pouvons en déduire que les cellules sont en bonne santé.
+
+-   **Filtrage de qualité optimisé** :
+
+L'objectif est de ne conserver que les cellules présentant entre 300 et 6 000 gènes, seuils basés sur ce que nous avons observés plus haut. Pour le contrôle mitochondrial, nous avons choisi un seuil de 1,5 %.
+
+Ce choix se justifie par la qualité globale de l'échantillon : le taux maximal observé étant de 1,45 %, un seuil à 1,5 % permet d'exclure tout début de dégradation cellulaire tout en conservant l'intégralité des cellules saines. Cette étape n'est pas obligatoire mais il est plus sûr de la faire.
+
+```{r}
+#| label: data-filter-strict
+#| message: false
+#| warning: false
+seurat_obj_urchin <- subset(seurat_obj_urchin, 
+                     subset = nFeature_RNA > 300 & 
+                              nFeature_RNA < 6000 & 
+                              percent.mt < 1.5)
+
+VlnPlot(seurat_obj_urchin, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+Le résultat du filtrage montre une distribution des métriques de qualité beaucoup plus homogène. En plafonnant le nombre de gènes à 6 000 et le taux mitochondrial à 1,5 %, nous avons filtré le jeu de données plus "propement". Ces données constituent donc une base assez solide pour l'étape de détection des doublets qui peuvent être restés.
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: data-filtered-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce deuxième filtrage : 
+
+stats_2 <- data.frame(
+  "Type de données" = c("Filtrées optimisées",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin$nFeature_RNA) )))
+print(stats_2)
+
+```
+
+Nous observons un affinement de nos données par rapport au filtrage précédent. En effet, le passage à un seuil mitochondrial plus strict nous a permis de passer de 6 743 à 6 735 cellules sélectionnées. La médiane du nombre de gènes par cellule reste stable, passant de 2 204 à 2 203, ce qui confirme que nous n'avons éliminé que des éléments qui n'affectaient pas la richesse globale du jeu de données.
+
+La prochaine étape consistera à identifier et éliminer les doublets restants. Toutefois, avant de procéder à cette détection statistique, il est important de normaliser les données afin de corriger les variations techniques de profondeur de séquençage entre les cellules.
+
+## Normalisation, réduction de dimension et clustering
+
+-   **Normalisation**
+
+Ici nous normalisons avant l'étape Doubletfinder car il crée des "cellules artificielles" en mélangeant les profils d'expression de nos vraies cellules. Pour que ce mélange mathématique fonctionne, il faut que toutes les cellules soient sur la même échelle de mesure, d'où l'interêt de la normalisation.
+
+```{r}
+#| label: sctransform-pca
+#| message: false
+#| warning: false
+
+# SCTransform fait tout : Normalisation, Scaling et sélection des gènes variables 
+# On précise variable.features.n = 3000 
+seurat_obj_urchin <- SCTransform(seurat_obj_urchin, 
+                          method = "glmGamPoi", 
+                          variable.features.n = 3000, 
+                          verbose = FALSE)
+
+#On lance la PCA directement après
+seurat_obj_urchin <- RunPCA(seurat_obj_urchin, verbose = FALSE)
+
+```
+
+**SCTransform** : est une méthode qui utilise un modèle de régression (Gamma-Poisson) pour stabiliser la variance et corriger les effets de profondeur de séquençage. Elle offre une meilleure définition des gènes hautement variables (ici, les 3 000 gènes les plus informatifs) par rapport aux méthodes de normalisation logarithmiques classiques. Cette étape est importante pour la réduction de dimension (PCA) et la détection des doublets.
+
+**PCA** : l'analyse en composantes principales permet de réduire la complexité de milliers de gène en quelques axes mathématiques (les PC), ""en général"" les premières composantes capturent les variations biologiques les plus fortes.
+
+Une fois la normalisation par SCTransform effectuée, nous avons réalisé une Analyse en Composantes Principales (PCA). L'objectif est maintenant d'identifier les composantes principales (PC) qui expliquent le mieux la variance observée dans nos données. Déterminer le nombre optimal de PC est donc essentiel pour que DoubletFinder puisse comparer efficacement les vraies cellules aux doublets simulés.
+
+-   **Réduction de dimension**
+
+```{r}
+#| label: composantes-principales
+#| message: false
+#| warning: false
+
+# On visualise quels sont les axes qui explique le plus la variance : 
+ElbowPlot(seurat_obj_urchin) + 
+  labs(
+    x = "PC (Composantes Principales)", 
+    y = "Écart-type (Standard Deviation)",
+    title = "Détermination du nombre de PC (Elbow Plot)"
+  ) +
+  theme_classic()
+# On voit qu'on a un coude au niveau de 10-15
+# On garde les 15 premiers axes mais selon ce qu'on va observé avec les clusters par la suite on pourrait baisser le nombre de PC (À 13 par exemple)
+
+```
+
+L'examen de l'Elbow Plot révèle un coude situé entre les PC 10 et 15. Pour la suite de l'analyse, nous choisissons de conserver les 15 premières composantes principales, car elles capturent l'essentiel de la structure biologique de l'échantillon. Il sera toutefois intéressant, lors des étapes de clustering, de tester différentes résolutions et un nombre d'axes réduit afin d'observer la stabilité des clusters.
+
+-   **Clustering et UMAP**
+
+Afin d'optimiser la détection par DoubletFinder, nous allons réaliser une première réduction de dimension (UMAP) et un clustering préliminaire. Le clustering est nécessaire car l'algorithme s'appuie sur la structure locale des données et les identités des clusters pour modéliser les doublets artificiels. La UMAP n'a pas d'intérêt, à part juste une première visualisation.
+
+```{r}
+#| label: clustering-UMAP
+#| message: false
+#| warning: false
+seurat_obj_urchin <- RunUMAP(seurat_obj_urchin, dims = 1:15)
+seurat_obj_urchin <- FindNeighbors(seurat_obj_urchin, dims = 1:15)
+seurat_obj_urchin <- FindClusters(seurat_obj_urchin, resolution = 0.5)
+```
+
+**RunUMAP** : Cette fonction génère une ""projection"" ""non linéaire!"" en 2D de nos 15 composantes principales. L'UMAP permet de visualiser la proximité entre les cellules : plus deux points sont proches sur le graphique, plus leur profil d'expression génique est similaire.
+
+**FindNeighbors** : Calcule un graphe de voisinage. Pour chaque cellule, l'algorithme cherche ses "voisins" les plus proches dans l'espace de la PCA. C'est la base mathématique nécessaire au partitionnement des données.
+
+**FindClusters** : C'est l'étape de regroupement proprement dite. Nous utilisons ici une résolution de 0,5, qui est une valeur standard pour un jeu de données de cette taille,c'est une valeur par défaut mais nous nous y interresserons de plus prêt plus tard.
+
+Ce clustering est temporaire, mais nous voyons que nous avons 15 clusters préliminaires.
+
+```{r}
+#| label: UMAP
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  ggtitle("UMAP préliminaire (avant DoubletFinder)")
+```
+
+Maintenant que nos clusters préliminaires sont définis, nous pouvons préparer l'exécution de DoubletFinder. Une étape importante avant le lancement de l'algorithme est le calcul de la proportion homotypique.
+
+## Calcul de la proportion homotypique et des paramètres de DoubletFinder
+
+Les doublets homotypiques correspondent à la fusion de deux cellules de même type (provenant du même cluster). Ces doublets sont biologiquement moins gênants car ils ne créent pas de "faux" types cellulaires, contrairement aux doublets hétérotypiques (mélange de deux types différents). En estimant cette proportion, nous pouvons affiner le nombre attendu de doublets à exclure pour ne cibler que les plus problématiques.
+
+-   **Proportion homotypique**:
+
+https://cdn.10xgenomics.com/image/upload/v1722285481/support-documents/CG000315_ChromiumNextGEMSingleCell3\_\_GeneExpression_v3.1_DualIndex\_\_RevF.pdf
+
+```{r}
+#| label: proportion-homotypique
+#| message: false
+#| warning: false
+
+# Calcul de la proportion homotypique basée sur les clusters (résolution 0.5)
+# Cela estime la probabilité que deux cellules d'un doublet viennent du même cluster.
+homotypic.prop <- modelHomotypic(seurat_obj_urchin@active.ident) 
+
+# Définition du taux de multiplets attendu 
+# Selon 10x Genomics, pour ~6700 cellules récupérées, le taux est d'environ 5.4% (0.054), car pour 6000 cell on a : 4,8% et pour 7000 cell on a : 5,6 %,
+expected_rate <- 0.054
+nExp_poi <- round(expected_rate * ncol(seurat_obj_urchin)) 
+nExp_poi
+# Ajustement du nombre final de doublets à détecter
+# On retire les doublets homotypiques car ils sont indifférenciables des singlets au niveau de l'expression génique.
+nExp_final <- round(nExp_poi * (1 - homotypic.prop))
+nExp_final
+
+```
+
+La comparaison entre le nombre théorique de doublets attendus (364) et le nombre final calculé après ajustement homotypique (329) montre une cohérence. Cette légère différence s'explique par le fait que nous avons soustrait les doublets dits « homotypiques ». Comme ces doublets sont formés par deux cellules de même type, leur profil d'expression reste propre et ne crée pas de faux clusters. En ciblant uniquement les 329 doublets hétérotypiques, nous nous concentrons sur les artefacts qui pourraient fausser l'identification des lignages cellulaires.
+
+La prochaine étape consiste à calibrer les paramètres de l'algorithme DoubletFinder
+
+-   **Définition des paramètres de DoubletFinder**
+
+L'objectif est d'identifier précisément les "doublets" (deux cellules capturées dans une seule gouttelette) qui subsistent dans notre échantillon.
+
+```{r}
+options(future.globals.maxSize = 15000 * 1024^2)
+
+plan("sequential") # Désactive le multi-cœur pour économiser la RAM physique
+#j'ai rajouté cette étape car mon ordinateur avait du mal a faire le travail 
+```
+
+```{r}
+#| label: parametres-doubletfinder
+#| message: false
+#| warning: false
+
+# Simulation des doublets et balayage des paramètres :
+# On utilise les 15 PC
+sweep.res.list <- paramSweep(seurat_obj_urchin, PCs = 1:15, sct = TRUE)
+
+# Résumé des statistiques du balayage
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+
+# Calcul du pK optimal, réglage du filet
+bcmvn <- find.pK(sweep.stats)
+
+```
+
+Pour finaliser la configuration de DoubletFinder, nous avons analysé la distribution du coefficient de bimodalité (BCmetric) en fonction du paramètre pK. Le graphique présente un pic distinct, identifiant la valeur de pK pour laquelle la séparation entre les singlets et les doublets artificiels est maximale.
+
+L'utilisation de ce pK optimal permet d'ajuster la sensibilité du filet de détection, garantissant ainsi que les 329 doublets identifiés précédemment correspondent à des artefacts réels et non à une variation biologique naturelle.
+
+```{r}
+#| label: extraction-du-pk-optimal
+#| message: false
+#| warning: false
+
+# Extraction du pK optimal
+pK_opt <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+print(paste("Le pK optimal identifié est :", pK_opt))
+
+#Le paramètre pK représente la "finesse" ou le voisinage (PC neighborhood size) utilisé pour cette comparaison.
+```
+
+## DoubletFinder
+
+Le paramètrage de doubletfinder fait, nous pouvons lancer la detection des doublets.
+
+-   **Detection des doublets** :
+
+```{r}
+#| label: detection-des-doublets
+#| message: false
+#| warning: false
+# On s'assure que l'objet est bien préparé
+
+seurat_obj_urchin <- doubletFinder(
+  seu = seurat_obj_urchin, 
+  PCs = 1:15, 
+  pN = 0.25, 
+  pK = pK_opt,        # On utilise la valeur optimale du graphique
+  nExp = nExp_final,  # 329 doublets
+  sct = TRUE          # Indispensable avec SCTransform
+)
+
+class_col <- grep("DF.classifications", colnames(seurat_obj_urchin@meta.data), value = TRUE)
+
+# Vérification des colonnes
+message(paste("Doublets identifiés dans la colonne :", class_col))
+print(class_col)
+```
+
+Nous avons exécuté l'algorithme DoubletFinder en utilisant le pK optimal identifié précédemment. Cette étape compare chaque cellule réelle à des doublets artificiels générés par simulation.
+
+L'algorithme a indiqué les 329 cellules comme étant des doublets hétérotypiques. Cela nous permettra, dans l'étape suivante, de visualiser la localisation de ces doublets sur notre UMAP avant de procéder à leur élimination définitive.
+
+-   **Visualisation des doublets**
+
+```{r}
+#| label: visualisation-des-doublets
+#| message: false
+#| warning: false
+# Visualisation :On affiche les doublets détectés en rouge sur l'UMAP.
+DimPlot(seurat_obj_urchin, group.by = class_col, cols = c("Singlet" = "black", "Doublet" = "red")) +
+  ggtitle("Doublets identifiés (en rouge)")
+```
+
+L'affichage de la projection UMAP permet de confirmer la pertinence de l'identification. La détection étant validée, nous procédons désormais à la suppression définitive de ces doublets pour ne conserver que les singlets (cellules uniques) pour la suite de l'analyse. La suppression de ces 329 cellules n'est pas une perte, mais un gain de précision.
+
+-   **Suppression des doublets** :
+
+```{r}
+#| label: suppression-des-doublets
+#| message: false
+#| warning: false
+# Suppression définitive des doublets pour ne garder que les "Singlets" (vraies cellules).
+seurat_obj_urchin <- subset(seurat_obj_urchin, subset = !!sym(class_col) == "Singlet")
+DimPlot(seurat_obj_urchin, group.by = class_col, cols = c("Singlet" = "black", "Doublet" = "red")) +
+  ggtitle("Doublets identifiés (en rouge)")
+```
+
+Une fois l'étape de suppression des doublets réalisée, nous pouvons passer au clustering final de nos cellules. Toutefois, avant de fixer un nombre définitif de cluster, nous allons explorer différentes résolutions pour identifier la plus optimale. Cette démarche nous permettra de choisir le niveau le plus stable et le plus cohérent d'un point de vue biologique.
+
+## Analyse de la résolution et arbre de clustering
+
+Avant de fixer une partition définitive des populations cellulaires, nous testons différentes résolutions allant de 0,1 à 1,0 avec un pas de 0,1.
+
+L'objectif est de déterminer quelle résolution reflète le mieux la réalité biologique. Une résolution trop faible masquerait la diversité des types cellulaires (sous-clustering), tandis qu'une résolution trop élevée pourrait diviser artificiellement des populations homogènes en créant des clusters sans signification biologique (sur-clustering). L'utilisation d'un arbre de clustering (clustree) nous permettra d'observer la stabilité de ces divisions.
+
+-   **Test de résolution** :
+
+```{r}
+#| label: test-de-resolution
+#| message: false
+#| warning: false
+res_to_test <- seq(0.1, 1, by = 0.1)
+seurat_obj_urchin <- FindClusters(seurat_obj_urchin, resolution = res_to_test)
+```
+
+-   **Arbre de clustering** :
+
+```{r}
+#| label: clustering-tree 
+#| message: false
+#| warning: false
+# Arbre de clustering
+print(clustree(seurat_obj_urchin, prefix = "SCT_snn_res."))
+```
+
+**Flèches** : les flèches droites indiquent que les clusters sont bien définis et que les cellules ne sautent pas d'un groupe à l'autre.
+
+Notre jeu de données semble très robuste. Les populations cellulaires sont distinctes et ne se mélangent pas, même quand nous augmentons la résolution.
+
+*À basse résolution (0.1 à 0.3)* : On voit le cluster rouge (0) se diviser en trois (0, 1, 3 en orange). 3 Feuillets embryonnaires ?
+
+*À haute résolution (0.7 à 1.0)* : On commence à voir des flèches qui se croisent, notamment sur la gauche (entre les clusters bleus et violets). C'est le signe que l'algorithme essaie de diviser des populations qui sont très proches biologiquement.
+
+Ici une bonne résolution serait entre 0.4 et 0.5, nous avons des clusters bien nets, qui ont l'air bien stables.
+
+Pour la suite ""du clustering final"", nous avons opté pour une résolution de 0.5. Ce choix s'appuie sur la stabilité observée dans l'arbre de clustering (clustree) à ce niveau. Cette résolution permet d'identifier les principales populations cellulaires de manière robuste, tout en conservant la flexibilité nécessaire pour affiner ou ajuster ce paramètre ultérieurement si l'identification de sous-types cellulaires plus précis l'exige.
+
+## Clustering Final
+
+-   **Calcul des clusters finaux** :
+
+```{r}
+#| label: clustering-final 
+#| message: false
+#| warning: false
+#| # On recalcule les clusters sur les données propres.
+seurat_obj_urchin <- FindNeighbors(seurat_obj_urchin, dims = 1:15)
+seurat_obj_urchin <- FindClusters(seurat_obj_urchin, resolution = 0.5) # Groupe les cellules par types
+seurat_obj_urchin <- RunUMAP(seurat_obj_urchin, dims = 1:15)
+seurat_obj_urchin <- RunTSNE(seurat_obj_urchin, dims = 1:15)
+
+```
+
+-   **Nombre de cellules gardées et médianne :**
+
+```{r}
+#| label: data-final-stat
+#| message: false
+#| warning: false
+# On regarde le nombre de cellules gardées après ce dernier filtrage : 
+
+stats_3 <- data.frame(
+  "Type de données" = c("Filtrées optimisées",
+  "Nombre de Barcodes" = c(ncol(seurat_obj_urchin)),
+  "Médiane Gènes/Cellule" = c(median(seurat_obj_urchin$nFeature_RNA) )))
+print(stats_3)
+
+```
+
+Nous observons un affinement de nos données suite à l'élimination des doublets. Cette étape nous a permis de passer de 6 735 à 6 406 cellules sélectionnées. La médiane du nombre de gènes par cellule reste stable, progressant même légèrement de 2 203 à 2 211, ce qui confirme que nous avons éliminé les artefacts techniques sans affecter la complexité biologique globale du jeu de données.
+
+Ces résultats nous rapprochent significativement de l'objectif initial fixé par le rapport de Cell Ranger, qui affichait 6 348 cellules et une médiane de 2 266 gènes. La cohérence entre nos filtres manuels et les métriques de référence valide la robustesse de notre protocole de nettoyage.
+
+""Mais celranger n'élimine pas les doublets!""
+
+## Visualisations Finales
+
+-   **UMAP** :
+
+```{r}
+#| label: umap
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + ggtitle("UMAP Finale (Singlets uniquement)")
+```
+
+-   **TSNE** :
+
+```{r}
+#| label: tsne
+#| message: false
+#| warning: false
+DimPlot(seurat_obj_urchin, reduction = "tsne", label = TRUE) + ggtitle("TSNE Finale (Singlets uniquement)")
+```
+
+## Indentifictaion des Clusters
+
+-   **Nombre de gènes par cluster** :
+
+```{r}
+print(table(Idents(seurat_obj_urchin)))
+```
+
+-   **Identification des gènes sur-exprimés** : "" pas sur exprimés, différentiellement
+-   exprimés"" "" Pourquoi que les positifs?"" -\> pour pas avoir des doublons, on cherche les gènes sur exprimés dans un cluster.
+
+```{r}
+# Identification des gènes marqueurs : Quels gènes sont spécifiques à chaque groupe ?
+all_markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.50) # on veut que les gènes surexprimés, présent dans au moins 25% des cellules avec une dif d'expression d'au moins 0,25
+# Tableau récapitulatif du nombre de cellules par cluster
+print(table(Idents(seurat_obj_urchin)))
+```
+
+-   **Extraction des gènes marqueurs** :
+
+```{r}
+top40<- all_markers %>% group_by(cluster) %>% top_n(n = 40, wt = avg_log2FC)
+print(top40)
+```
+
+-   **Enregistrement des listes des 40 premiers gènes par clusters** :
+
+```{r}
+# Définissions du chemin 
+#
+chemin_bureau <- "~/Desktop/Resultats_Analyse_3"
+
+for (i in 0:14) {
+  
+  # Filtrer les gènes pour le cluster actuel
+  current_cluster_genes <- all_markers[all_markers$cluster == i, ]
+  
+  # Extraire les 40 meilleurs
+  top_40 <- head(current_cluster_genes, 40)
+  
+  # Afficher
+  cat("\n--- Top 40 pour le Cluster", i, "---\n")
+  print(head(top_40, 40)) 
+  
+  # Sauvegarder le fichier CSV 
+  nom_fichier <- paste0(chemin_bureau, "/marqueurs_cluster", i, "_40g.csv")
+  write.csv(top_40, file = nom_fichier, row.names = FALSE)
+  
+}
+```
+
+Pour enregistrer tout ce que j'ai fais :
+
+```{r}
+# Créer le dossier sur le bureau
+dir.create("~/Desktop/mon_dossier_analyse", recursive = TRUE, showWarnings = FALSE)
+
+# Sauvegarder l'objet
+saveRDS(seurat_obj_urchin, file = "~/Desktop/mon_dossier_analyse/seurat_final.rds")
+```
+
+Pour tous les gènes ?
+
+```{r}
+# Définition du chemin vers ton Bureau
+chemin_bureau <- "~/Desktop/Resultats_Analyse_3"
+
+# Créer le dossier s'il n'existe pas encore
+if (!dir.exists(chemin_bureau)) {
+  dir.create(chemin_bureau)
+}
+
+for (i in 0:14) {
+  
+  # 1. Filtrer les gènes spécifiquement pour le cluster i
+  # On s'assure que la colonne s'appelle bien 'cluster'
+  current_cluster_genes <- all_markers[all_markers$cluster == i, ]
+  
+  # 2. Définir le nom du fichier dynamiquement
+  nom_fichier <- paste0(chemin_bureau, "/marqueurs_cluster", i, "_all.csv")
+  
+  # 3. SAUVEGARDER l'objet filtré (current_cluster_genes) et non la table entière
+  write.csv(current_cluster_genes, file = nom_fichier, row.names = FALSE)
+  
+}
+```
+
+## **Etoderme ventral** : Nodal, lefty, BMP2/4,smad 2/3, Alk 4/5/7, Chordin, Goosecoid, Brachyury, foxA, NK1, FoxG, fgfr1, ADMP, Not
+
+-   **Nodal** : Nodal pour faire plaisir à Thierry
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Nodal")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Nodal")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Nodal")
+```
+
+-   **Lefty** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Lefty")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Lefty")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Lefty")
+```
+
+-   **Chordin** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Chordin")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Chordin")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Chordin")
+```
+
+-   **Not** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Not")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Not")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Not")
+```
+
+-   **Bmp2/4** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Bmp2/4-1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Bmp2/4-1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Bmp2/4-1")
+```
+
+```{r}
+# Cette ligne cherche tous les gènes qui commencent par "Bmp" ou "BMP"
+grep("^BMP|^Bmp", rownames(seurat_obj), value = TRUE)
+```
+
+```{r}
+
+grep("^Smad|^SMAD", rownames(seurat_obj), value = TRUE)
+```
+
+-   **Smad 2/3** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP 
+FeaturePlot(seurat_obj_urchin, features = "Smad2/3")
+
+# Pour comparer côte à côte avec les clusters
+
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + FeaturePlot(seurat_obj_urchin, features = "Smad2/3")
+
+# Trouve les marqueurs pour tous les clusters
+
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE) # Filtre pour voir dans quel cluster le gène
+subset(markers, gene == "Smad2/3")
+```
+
+```{r}
+grep("^fox|^Fox", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "FoxA")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "FoxA")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "FoxA")
+```
+
+```{r}
+# Cette ligne cherche tous les gènes qui commencent par "Bmp" ou "BMP"
+grep("^alk|^Alk", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^goosecoid|^Goosecoid", rownames(seurat_obj_urchin), value = TRUE)
+grep("^brachyury|^Brachyury", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^NK|^Nk", rownames(seurat_obj_urchin), value = TRUE)
+grep("^fgfr|^FGFR", rownames(seurat_obj_urchin), value = TRUE)
+grep("^admp|^ADMP", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+-   **Nk1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Nk1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Nk1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Nk1")
+```
+
+J'identifie le cluster 0, clairement comme de l'ectoderme ventral.
+
+## **Endoderm** : nB-catenin/TCF, Hox11/13b, Wnt1, Blimp1, FoxA, brachyury, blimp1b.
+
+```{r}
+grep("^TCF|^tcf", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Hox|^hox", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Wnt|^wnt", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Blimp|^blimp", rownames(seurat_obj_urchin), value = TRUE)
+grep("^bra|^Bra", rownames(seurat_obj_urchin), value = TRUE)
+grep("^cat|^Cat", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+-   **Hox11/13b** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Hox11/13b")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Hox11/13b")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Hox11/13b")
+```
+
+-   **Wnt1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Wnt1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Wnt1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Wnt1")
+```
+
+-   **Blimp1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Blimp1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Blimp1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Blimp1")
+```
+
+-   **Bra** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Bra")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Bra")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Bra")
+```
+
+##Endoderm dorsal : Alk3/6, smad1/5/8, nlk, foxD.
+
+```{r}
+grep("^Alk|^alk", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Smad|^smad", rownames(seurat_obj_urchin), value = TRUE)
+grep("^nlk|^Nlk", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Fox|^fox", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Alk3-6** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Alk3-6")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Alk3-6")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Alk3-6")
+```
+
+-   **Smad1/5/8** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Smad1/5/8")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Smad1/5/8")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Smad1/5/8")
+```
+
+-   **Nlk** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Nlk")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Nlk")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Nlk")
+```
+
+##Mesoderme: Nlk, nB-catenin/TCF,notch, Hox11/13b, wnt1, Blimp1, Fox A, brachyury
+
+Ici on a déjà chercher une grande majorité des gènes, on va donc juste regarder si on trouve Notch.
+
+```{r}
+grep("^notch|^Notch", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+-   **Notch** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Notch")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Notch")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Notch")
+```
+
+##PMC: Alk3/6, Smad1/5/8,tbx2/3, SM30
+
+```{r}
+grep("^Alk|^alk", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Smad|^smad", rownames(seurat_obj_urchin), value = TRUE)
+grep("^tbx|^Tbx", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Sm|^SM", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Sm|^sm", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Smad1/5/8** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Smad1/5/8")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Smad1/5/8")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Smad1/5/8")
+```
+
+-   **Tbx2-3** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Tbx2-3")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Tbx2-3")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Tbx2-3")
+```
+
+-   **Sm30E** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Sm30E")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Sm30E")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Sm30E")
+```
+
+-   **Sm30b** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Sm30b")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Sm30b")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Sm30b")
+```
+
+##SMC ventral et dorsal : Notch, delta, alk4/5/7, SuH, Smad2/3, ets1, erg, profilin, gcm, GATA1/2/3, Imo2, ese, GATA C (ventral), Alk3/6, delta, notch, smad1/5/8,gcm, GATA1/2/3, Imo2, ese.
+
+```{r}
+grep("^Delta|^delta", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Alk|^alk", rownames(seurat_obj_urchin), value = TRUE)
+grep("^SuH|^SUH", rownames(seurat_obj_urchin), value = TRUE)
+grep("^suh|^Suh", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Smad|^smad", rownames(seurat_obj_urchin), value = TRUE)
+grep("^ets|^Ets", rownames(seurat_obj_urchin), value = TRUE)
+grep("^erg|^Erg", rownames(seurat_obj_urchin), value = TRUE)
+grep("^profilin|^Profilin", rownames(seurat_obj_urchin), value = TRUE)
+grep("^gcm|^Gmc", rownames(seurat_obj_urchin), value = TRUE)
+grep("^GMC|^gmc", rownames(seurat_obj_urchin), value = TRUE)
+grep("^GATA|^Gata", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Imo|^IMO", rownames(seurat_obj_urchin), value = TRUE)
+grep("^imo|^IMO", rownames(seurat_obj_urchin), value = TRUE)
+grep("^ese|^Ese", rownames(seurat_obj_urchin), value = TRUE)
+grep("^ESE|^Ese", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Delta** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Delta")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Delta")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Delta")
+```
+
+-   **Erg** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Erg")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Erg")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Erg")
+```
+
+-   **Profilin** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Profilin")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Profilin")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Profilin")
+```
+
+-   **GataC** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "GataC")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "GataC")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "GataC")
+```
+
+-   **Ese** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Ese")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Ese")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Ese")
+```
+
+```{r}
+grep("^Nk|^nk", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^oasis|^Oasis", rownames(seurat_obj_urchin), value = TRUE)
+grep("^msx|^Msx", rownames(seurat_obj_urchin), value = TRUE)
+grep("^irx|^Irx", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Dlx|^dlx", rownames(seurat_obj_urchin), value = TRUE)
+grep("^atbf|^ATBF", rownames(seurat_obj_urchin), value = TRUE)
+grep("^hox|^Hox", rownames(seurat_obj_urchin), value = TRUE)
+grep("^unc|^Unc", rownames(seurat_obj_urchin), value = TRUE)
+grep("^admp|^Admp", rownames(seurat_obj_urchin), value = TRUE)
+grep("^id|^Id", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Creb|^CREB", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Univin|^univin", rownames(seurat_obj_urchin), value = TRUE)
+grep("^otx|^Otx", rownames(seurat_obj_urchin), value = TRUE)
+grep("^Pax|^pax", rownames(seurat_obj_urchin), value = TRUE)
+grep("^dri|^Dri", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+-   **Nk2-2**:
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Nk2-2")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Nk2-2")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Nk2-2")
+```
+
+-   **Msx** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Msx")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Msx")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Msx")
+```
+
+-   **IrxA** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "IrxA")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "IrxA")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "IrxA")
+```
+
+-   **Dlx** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Dlx")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Dlx")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Dlx")
+```
+
+-   **Unc4.1**:
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Unc4.1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Unc4.1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Unc4.1")
+```
+
+-   **Id** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Id")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Id")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Id")
+```
+
+-   **Otx** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Otx")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Otx")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Otx")
+```
+
+-   **Pax2-5-8** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Pax2-5-8")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Pax2-5-8")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Pax2-5-8")
+```
+
+-   **Goosecoid (Gsc)** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Gsc.1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Gsc.1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Gsc.1")
+```
+
+```{r}
+grep("Calm|^calm", rownames(seurat_obj_urchin), value = TRUE)
+grep("CALM|^calm", rownames(seurat_obj_urchin), value = TRUE)
+```
+
+-   **Calmodulin (Calm2)** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Calm2")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Calm2")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Calm2")
+```
+
+```{r}
+grep("^gcm|^Gcm", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^GCM|^GCm", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Gcm**:
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Gcm")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Gcm")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Gcm")
+```
+
+```{r}
+grep("^fox|^Fox", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^sfrp|^Sfrp", rownames(seurat_obj_urchin), value = TRUE)
+grep("^dkk|^Dkk", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Sfrp1/5** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Sfrp1/5")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Sfrp1/5")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Sfrp1/5")
+```
+
+-   **Dkk3** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Dkk3")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Dkk3")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Dkk3")
+```
+
+```{r}
+grep("^Bpmt|^bpmt", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^ske|^Ske", rownames(seurat_obj_urchin), value = TRUE)
+grep("^alx|^Alx", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Alx1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Alx1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Alx1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Alx1")
+```
+
+```{r}
+grep("^papss|^Papss", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^ske|^SKE", rownames(seurat_obj_urchin), value = TRUE)
+grep("^erk|^Erk", rownames(seurat_obj_urchin), value = TRUE)
+
+```
+
+-   **Papss-1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Papss-1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Papss-1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Papss-1")
+```
+
+```{r}
+grep("^bhmt|^Bhmt", rownames(seurat_obj_urchin), value = TRUE)
+
+grep("^Ncam|^ncam", rownames(seurat_obj_urchin), value = TRUE)
+
+
+```
+
+-   **Bhmt-1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Bhmt-1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Bhmt-1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Bhmt-1")
+```
+
+-   **Ncam.1** :
+
+```{r}
+# Visualiser l'expression du gène sur l'UMAP
+FeaturePlot(seurat_obj_urchin, features = "Ncam.1")
+
+# Pour comparer côte à côte avec les clusters
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE) + 
+  FeaturePlot(seurat_obj_urchin, features = "Ncam.1")
+
+# Trouve les marqueurs pour tous les clusters
+markers <- FindAllMarkers(seurat_obj_urchin, only.pos = TRUE)
+# Filtre pour voir dans quel cluster le gène apparaît
+subset(markers, gene == "Ncam.1")
+```
+
+Annoter les clusters :
+
+```{r}
+
+Idents(seurat_obj_urchin) <- "seurat_clusters"
+
+# 2. Définir les étiquettes (en s'assurant que les clés sont des caractères)
+new.cluster.ids <- c(
+  "0" = "Ectoderme ventral (cluster 0)",
+  "2" = "Ectoderme dorsal (cluster 2)",
+  "3" = "Endoderme (cluster 3)", 
+  "8" = "Etoderme ventral bis (cluster 8)",
+  "10" = "PMC (cluster 10)",
+  "14" = "Neural (cluster 14)"
+)
+
+# 3. Renommer
+seurat_obj_urchin <- RenameIdents(seurat_obj_urchin, new.cluster.ids)
+
+# Vérification du DimPlot
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE, pt.size = 0.5) +
+  ggtitle("Annotation des territoires - Stade Mésenchyme Blastula")
+DimPlot(seurat_obj_urchin, reduction = "umap", label = TRUE, pt.size = 0.5) +
+  ggtitle("Annotation des territoires - Stade Mésenchyme Blastula")
+```
+
+```{r}
+DimPlot(seurat_obj_urchin, reduction = "tsne", label = TRUE, pt.size = 0.5) +
+  ggtitle("Annotation des territoires - Stade Mésenchyme Blastula")
+
+```
